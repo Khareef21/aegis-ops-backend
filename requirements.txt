@@ -2,3 +2,5 @@ fastapi
 uvicorn[standard]
 supabase
 anthropic
+pydantic
+python-dotenv

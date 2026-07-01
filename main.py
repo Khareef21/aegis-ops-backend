@@ -8,7 +8,6 @@ import anthropic
 
 app = FastAPI(title="Aegis Ops API")
 
-# Allow frontend to talk to this backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,7 +15,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Connect to Supabase and Claude
 supabase = create_client(
     os.environ["SUPABASE_URL"],
     os.environ["SUPABASE_SERVICE_KEY"]
@@ -25,22 +23,17 @@ claude = anthropic.Anthropic(
     api_key=os.environ["ANTHROPIC_API_KEY"]
 )
 
-# ── Request model ──────────────────────
 class EmailPayload(BaseModel):
     raw_email: str
     sender: str = "unknown@vendor.com"
     subject: str = "No subject"
 
-# ── Health check ───────────────────────
 @app.get("/")
 async def root():
     return {"status": "Aegis Ops API is running"}
 
-# ── POST /webhook/email ────────────────
 @app.post("/webhook/email")
 async def process_email(payload: EmailPayload):
-
-    # STEP 1: Claude reads the email and extracts facts
     message = claude.messages.create(
         model="claude-haiku-4-5",
         max_tokens=512,
@@ -53,34 +46,26 @@ valid JSON with these exact keys:
 - sku (string)
 - delay_days (integer)
 - quantity_affected (integer)
-
 If any field is unclear, use null.
 Return ONLY the JSON object. No explanation. No markdown.
-
 Email:
 {payload.raw_email}"""
         }]
     )
-
     raw = message.content[0].text.strip()
-
-    # STEP 2: Parse Claude's JSON response
     try:
         extracted = json.loads(raw)
     except json.JSONDecodeError:
-        # Save as unresolved if Claude returns bad output
         supabase.table("triage_events").insert({
             "email_raw": payload.raw_email,
             "vendor_name": payload.sender,
             "status": "UNRESOLVED",
             "confidence_score": 0.0
         }).execute()
-        return {"status": "UNRESOLVED", "reason": "Claude parse failed"}
+        return {"status": "UNRESOLVED", "reason": "parse failed"}
 
     sku        = extracted.get("sku")
     delay_days = extracted.get("delay_days") or 0
-
-    # STEP 3: Check inventory for this SKU
     current_stock  = 0
     daily_velocity = 1
 
@@ -91,14 +76,9 @@ Email:
             current_stock  = inv.data[0]["current_stock"]
             daily_velocity = inv.data[0]["daily_velocity"]
 
-    # STEP 4: Calculate stockout risk
     stockout_in     = current_stock / max(daily_velocity, 0.1)
-    revenue_at_risk = max(
-        0,
-        (delay_days - stockout_in) * daily_velocity * 90
-    )
+    revenue_at_risk = max(0, (delay_days - stockout_in) * daily_velocity * 90)
 
-    # STEP 5: Decide severity
     if delay_days > stockout_in:
         status = "CRITICAL"
     elif delay_days > stockout_in * 0.75:
@@ -106,21 +86,19 @@ Email:
     else:
         status = "OK"
 
-    # STEP 6: Claude writes the vendor reply
     draft_msg = claude.messages.create(
         model="claude-haiku-4-5",
         max_tokens=300,
         messages=[{
             "role": "user",
-            "content": f"""Write a short, firm, professional
-B2B reply to a vendor about a {delay_days}-day delay
-on SKU {sku}. Revenue at risk: ${revenue_at_risk:.0f}.
-Keep it 2-3 sentences. No emojis. No fluff."""
+            "content": f"""Write a short, firm, professional B2B reply
+to a vendor about a {delay_days}-day delay on SKU {sku}.
+Revenue at risk: \${revenue_at_risk:.0f}.
+2-3 sentences. No emojis. No fluff."""
         }]
     )
     draft_reply = draft_msg.content[0].text.strip()
 
-    # STEP 7: Save everything to Supabase
     supabase.table("triage_events").insert({
         "email_raw":         payload.raw_email,
         "vendor_name":       extracted.get("vendor_name"),
@@ -141,10 +119,9 @@ Keep it 2-3 sentences. No emojis. No fluff."""
         "delay_days":      delay_days,
         "revenue_at_risk": round(revenue_at_risk, 2),
         "draft_reply":     draft_reply,
-        "message":         "Triage event saved to Supabase"
+        "message":         "Triage event saved"
     }
 
-# ── GET /triage ────────────────────────
 @app.get("/triage")
 async def get_triage():
     result = supabase.table("triage_events")\
@@ -153,7 +130,6 @@ async def get_triage():
         .execute()
     return result.data
 
-# ── POST /triage/{id}/approve ──────────
 @app.post("/triage/{event_id}/approve")
 async def approve_triage(event_id: str):
     supabase.table("triage_events")\
