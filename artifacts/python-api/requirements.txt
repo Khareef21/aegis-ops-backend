@@ -1,4 +1,4 @@
 fastapi
 uvicorn[standard]
 supabase
-anthropic
+google-generativeai

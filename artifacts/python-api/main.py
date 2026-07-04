@@ -4,11 +4,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client
-import anthropic
+import google.generativeai as genai
 
 app = FastAPI(title="Aegis Ops API")
 
-# Allow frontend to talk to this backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,14 +15,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Connect to Supabase and Claude
+# Connect to Supabase
 supabase = create_client(
     os.environ["SUPABASE_URL"],
     os.environ["SUPABASE_SERVICE_KEY"]
 )
-claude = anthropic.Anthropic(
-    api_key=os.environ["ANTHROPIC_API_KEY"]
-)
+
+# Connect to Gemini
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+model = genai.GenerativeModel("gemini-1.5-flash")
 
 # ── Request model ──────────────────────
 class EmailPayload(BaseModel):
@@ -40,13 +40,8 @@ async def root():
 @app.post("/webhook/email")
 async def process_email(payload: EmailPayload):
 
-    # STEP 1: Claude reads the email and extracts facts
-    message = claude.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=512,
-        messages=[{
-            "role": "user",
-            "content": f"""You are a supply chain assistant.
+    # STEP 1: Gemini reads the email and extracts facts
+    extract_prompt = f"""You are a supply chain assistant.
 Extract data from this vendor email and return ONLY
 valid JSON with these exact keys:
 - vendor_name (string)
@@ -56,26 +51,28 @@ valid JSON with these exact keys:
 
 If any field is unclear, use null.
 Return ONLY the JSON object. No explanation. No markdown.
+Do not wrap in code blocks.
 
 Email:
 {payload.raw_email}"""
-        }]
-    )
 
-    raw = message.content[0].text.strip()
+    extract_response = model.generate_content(extract_prompt)
+    raw = extract_response.text.strip()
 
-    # STEP 2: Parse Claude's JSON response
+    # Remove markdown code blocks if Gemini adds them
+    raw = raw.replace("```json", "").replace("```", "").strip()
+
+    # STEP 2: Parse Gemini's JSON response
     try:
         extracted = json.loads(raw)
     except json.JSONDecodeError:
-        # Save as unresolved if Claude returns bad output
         supabase.table("triage_events").insert({
             "email_raw": payload.raw_email,
             "vendor_name": payload.sender,
             "status": "UNRESOLVED",
             "confidence_score": 0.0
         }).execute()
-        return {"status": "UNRESOLVED", "reason": "Claude parse failed"}
+        return {"status": "UNRESOLVED", "reason": "parse failed"}
 
     sku        = extracted.get("sku")
     delay_days = extracted.get("delay_days") or 0
@@ -106,19 +103,15 @@ Email:
     else:
         status = "OK"
 
-    # STEP 6: Claude writes the vendor reply
-    draft_msg = claude.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=300,
-        messages=[{
-            "role": "user",
-            "content": f"""Write a short, firm, professional
+    # STEP 6: Gemini writes the vendor reply
+    draft_prompt = f"""Write a short, firm, professional
 B2B reply to a vendor about a {delay_days}-day delay
 on SKU {sku}. Revenue at risk: ${revenue_at_risk:.0f}.
-Keep it 2-3 sentences. No emojis. No fluff."""
-        }]
-    )
-    draft_reply = draft_msg.content[0].text.strip()
+Keep it 2-3 sentences. No emojis. No fluff.
+Return only the email text, nothing else."""
+
+    draft_response = model.generate_content(draft_prompt)
+    draft_reply = draft_response.text.strip()
 
     # STEP 7: Save everything to Supabase
     supabase.table("triage_events").insert({
@@ -132,7 +125,7 @@ Keep it 2-3 sentences. No emojis. No fluff."""
         "revenue_at_risk":   round(revenue_at_risk, 2),
         "status":            status,
         "draft_reply":       draft_reply,
-        "confidence_score":  0.92
+        "confidence_score":  0.95
     }).execute()
 
     return {
