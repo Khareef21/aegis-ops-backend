@@ -42,3 +42,7 @@ timeoutMs = 20000
 
 [nix]
 packages = ["psmisc"]
+
+[[ports]]
+localPort = 8001
+externalPort = 80
